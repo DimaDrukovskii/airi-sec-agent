@@ -243,6 +243,14 @@ class AgentState:
         # after construction to avoid a forward-reference on a class defined
         # later in the module).
         self.task_contract: Any = None
+        # Cost telemetry: how many times the primary loop had to restart
+        # (truncation/ITPM/network/rate-limit) and whether fallback/repair ran.
+        # Surfaced in the final_usage log line to make restart-driven token
+        # blowups (e.g. a truncated attempt discarding context and re-exploring)
+        # visible per task instead of only inferable from raw request counts.
+        self.restart_count: int = 0
+        self.fallback_used: bool = False
+        self.repair_attempted: bool = False
 
     def act(self, line: str) -> None:
         self.activity.append(line[:200])
@@ -847,9 +855,22 @@ def classify_mechanical(instruction: str) -> str:
         return "audit"
     if "flag{" in low or "ctf" in low or "capture the flag" in low:
         return "ctf"
-    if re.search(r"\bfix\b|\brepair\b|remediat|patch\b", low) and re.search(r"test|regression|pytest", low):
+    fix_signal = re.search(r"\bfix\b|\brepair\b|remediat|\bpatch\b", low)
+    # Find/audit-only tasks almost always name the bug class too ("SQL
+    # injection vulnerability", "insecure endpoint"), so a bare vulnerab/
+    # insecure catch-all below would misroute them into fix mode. Checking
+    # explicit report/read-only/identify-only signals first - and only when
+    # there is no actual fix/repair/patch instruction alongside them - keeps
+    # a hidden "find the vulnerability and report it" task from being treated
+    # as "fix the vulnerability" just because it names the vulnerability.
+    if not fix_signal and re.search(
+        r"do not modify|without modifying|read-?only|bug bounty|\baudit\b|\breport\b|\bfindings?\b|\bidentify\b|\bdocument\b",
+        low,
+    ):
+        return "audit"
+    if fix_signal and re.search(r"test|regression|pytest", low):
         return "fix"
-    if re.search(r"\bfix\b|\brepair\b|vulnerab|insecure", low):
+    if fix_signal or "vulnerab" in low or "insecure" in low:
         return "fix"
     if "audit" in low or "report" in low:
         return "audit"
@@ -1206,10 +1227,31 @@ def verify_deliverable(kind: str, deliverable: str, workdir: Path, expected_form
             return False, "flag file empty"
         if re.search(r"flag\{[^}\s]+\}|FLAG\{[^}\s]+\}|ctf\{[^}\s]+\}|CTF\{[^}\s]+\}", content):
             return True, "ok"
-        if expected_format and expected_format.lower() not in ("", "flag"):
-            # Task explicitly declared a different deliverable format; a
-            # flag{...} pattern was never promised, so non-empty content that
-            # follows the declared format is acceptable evidence.
+        fmt = (expected_format or "").lower()
+        if fmt == "json":
+            # extract_explicit_deliverable_format() flags "json" on any mention
+            # of the word anywhere in a (often long) instruction, so this branch
+            # must still structurally validate the content - otherwise any CTF
+            # task whose instruction happens to say "json" anywhere degrades
+            # back into "any non-empty file passes", the exact bug this
+            # function's docstring says was fixed.
+            try:
+                data = json.loads(content)
+            except Exception as exc:
+                return False, f"declared JSON format but content is not valid JSON: {exc}"
+            if data in (None, {}, [], "", 0, False):
+                return False, "declared JSON format but content is empty/trivial JSON"
+            return True, "ok"
+        if fmt == "kv":
+            if re.search(r"^[a-z_]+=\S+$", content.strip(), re.MULTILINE):
+                return True, "ok"
+            return False, "declared key=value format but no key=value line found"
+        if fmt and fmt != "flag":
+            # Some other explicitly declared non-flag format we have no
+            # structural validator for; still enforce a minimal length floor
+            # so a stray character or blank-ish file can't pass as "ok".
+            if len(content.strip()) < 3:
+                return False, "content too short to be a plausible deliverable for the declared format"
             return True, "ok"
         return False, "no flag{...}-style pattern found and no non-flag format was explicitly declared by the task"
     return True, "ok"
@@ -1878,6 +1920,7 @@ async def ensure_deliverable(instruction: str, kind: str, state: AgentState, del
         + f"\n\nTASK INSTRUCTION (for reference):\n{instruction[:2500]}"
         + f"\n\nPREVIOUS RUN ACTIVITY (what was already done/found — do NOT repeat it, use it):\n{activity_tail[:6000]}"
     )
+    state.repair_attempted = True
     try:
         await run_pyai_loop(repair_instruction, kind, state, min(10, budget_left), "", deliverable=deliverable)
     except Exception as exc:
@@ -1941,6 +1984,28 @@ def _is_input_token_limit(exc: Exception) -> bool:
             or "input tokens per minute" in text)
 
 
+def _with_prior_activity(instruction: str, state: AgentState) -> str:
+    """Restarting run_pyai_loop discards its pydantic-ai message history (a fresh
+    Agent/conversation is created per call), so a naive retry re-explores the
+    workspace from zero context - the same blind rediscovery that turned one
+    truncated attempt into a multi-hundred-K-token retry chain. state.activity
+    is a cheap (tool-name-only, no output bodies) ledger already used to brief
+    the repair loop; reuse it here so a restarted attempt knows what it already
+    tried and can act on it instead of repeating it."""
+    if not state.activity:
+        return instruction
+    tail = "\n".join(state.activity[-60:])
+    return (
+        instruction
+        + "\n\n[RESTART NOTICE] A previous attempt on this exact task already ran "
+          "the actions below before failing (token/output limit) - its filesystem "
+          "changes and discoveries still stand. Do NOT blindly repeat this "
+          "exploration; use what it already found and move straight to finishing "
+          "the task:\n"
+        + tail[:4000]
+    )
+
+
 async def main_async(instruction: str) -> str:
     state = AgentState(workdir=_resolve_workdir())
     _log("start", model=MODEL_NAME, workdir=str(state.workdir))
@@ -1998,10 +2063,11 @@ async def main_async(instruction: str) -> str:
     budget_main = MAX_REQUESTS - requests_used - REPAIR_RESERVE
     final = ""
     aggressive = False
+    active_instruction = instruction
     for attempt in range(4):
         try:
             final = await run_pyai_loop(
-                instruction, kind, state, budget_main, baseline,
+                active_instruction, kind, state, budget_main, baseline,
                 compactor_kwargs={"keep_last_returns": 2, "max_return_chars": 700, "max_text_chars": 500}
                 if aggressive else None,
                 deliverable=deliverable,
@@ -2021,10 +2087,15 @@ async def main_async(instruction: str) -> str:
                 if wait is not None:
                     _log("itpm_retry", wait_s=round(wait, 1), note="413: short bounded pause, restarting with aggressive compaction")
                     aggressive = True
+                    state.restart_count += 1
+                    active_instruction = _with_prior_activity(instruction, state)
                     await asyncio.sleep(wait)
                     continue
             if "token limit" in repr(exc) and "before any response" in repr(exc) and attempt < 3 and time_left() > 30:
-                _log("output_truncated_retry", note="finish_reason=length before any response; restarting primary")
+                _log("output_truncated_retry", note="finish_reason=length before any response; restarting primary with aggressive compaction + prior-activity brief")
+                aggressive = True
+                state.restart_count += 1
+                active_instruction = _with_prior_activity(instruction, state)
                 continue
             conn_error = ("Connection error" in repr(exc) or "ProxyError" in repr(exc)
                           or "ConnectError" in repr(exc))
@@ -2041,8 +2112,9 @@ async def main_async(instruction: str) -> str:
                     _log("rate_limit_backoff", wait_s=round(wait, 1))
                     await asyncio.sleep(wait)
                     continue
+            state.fallback_used = True
             try:
-                final = await run_openai_fallback(instruction, kind, state, min(budget_main, 30), baseline)
+                final = await run_openai_fallback(_with_prior_activity(instruction, state), kind, state, min(budget_main, 30), baseline)
             except Exception as exc2:
                 _log("fallback_loop_failed", error=repr(exc2),
                      tb=traceback.format_exc()[-2000:])
@@ -2058,6 +2130,11 @@ async def main_async(instruction: str) -> str:
     restored = _restore_tests(state.tests_snapshot)
     if restored:
         _log("tests_restored", files=restored, note="agent tampering with tests/harness files was rolled back")
+    # Cost breakdown: how much of REQUEST_COUNT/TOKENS_IN (final_usage, logged in
+    # main()) is attributable to primary-loop restarts vs. fallback/repair
+    # cascades, so a spike is diagnosable without re-running the task.
+    _log("cost_breakdown", primary_restarts=state.restart_count,
+         fallback_used=state.fallback_used, repair_attempted=state.repair_attempted)
     _log("done", kind=kind, tool_calls=state.tool_calls, wall_s=round(time.monotonic() - START, 1))
     return final or "finished"
 
