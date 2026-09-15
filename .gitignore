@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment / secrets
+.env
+.env.*
+*.key
+*.pem
+secrets.json
+
+# Logs and runtime artifacts
+*.log
+events.jsonl
+*.jsonl
+
+# OS / editor cruft
+.DS_Store
+.vscode/
+.idea/
