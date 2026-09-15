@@ -251,6 +251,18 @@ class AgentState:
         self.restart_count: int = 0
         self.fallback_used: bool = False
         self.repair_attempted: bool = False
+        # Generic (task-agnostic) mechanical-completion signal for fix-kind
+        # tasks: workspace_modified is set by any write-type tool call
+        # (evidence the agent actually changed something, not just probed),
+        # pytest_all_green tracks the LATEST run_pytest tool result (updated
+        # both ways - a later failing run un-sets it). Neither flag alone is
+        # sufficient evidence: a green pytest before any edit only means the
+        # suite was already passing pre-fix, and an edit with no pytest run
+        # confirming it is not verified success. Both true together is the
+        # generic completion condition consumed by main_async()'s recovery
+        # guard - see _mechanical_success().
+        self.workspace_modified: bool = False
+        self.pytest_all_green: bool = False
 
     def act(self, line: str) -> None:
         self.activity.append(line[:200])
@@ -810,6 +822,9 @@ TOOL_FUNCS: dict[str, Callable[..., Awaitable[str]]] = {
 }
 
 
+_WRITE_TOOLS = frozenset({"write_file", "append_file", "replace_in_file", "apply_patch"})
+
+
 async def _execute_tool(state: AgentState, name: str, kwargs: dict[str, Any]) -> str:
     """Run a tool via TOOL_FUNCS with execution-level logging. Shared by BOTH
     agent loops (pydantic-ai closures and raw-SDK fallback) so every local
@@ -822,6 +837,30 @@ async def _execute_tool(state: AgentState, name: str, kwargs: dict[str, Any]) ->
         result = f"ERROR: tool raised {exc!r}"
     _log("tool_result", tool=name, chars=len(result), _stdout_every=1)
     _log_transcript("tool_result", tool=name, result=_safe_log_value("result", result))
+    # Generic (task-agnostic) mechanical-completion signals: a write-type
+    # tool that succeeded (all four use the "OK:"-prefix convention on
+    # success, "ERROR:" on failure/revert) is evidence the workspace was
+    # actually changed; a run_pytest call updates the latest green/red state
+    # in BOTH directions, so a later regression un-sets a stale "green" flag.
+    # See AgentState.workspace_modified / pytest_all_green.
+    if name in _WRITE_TOOLS and isinstance(result, str) and result.startswith("OK:"):
+        state.workspace_modified = True
+    if name == "run_pytest" and isinstance(result, str):
+        # tool_run_pytest's structured output (parse_pytest_feedback) always
+        # contains the literal substrings "failed"/"error" as JSON key names
+        # ("failed_tests", "error_types_found") regardless of outcome, so a
+        # bare substring check would always read as red. Its "status" field
+        # is unreliable too: tool_run_pytest runs pytest with -q, whose
+        # summary line ("1 passed in 0.00s") has no "===...===" wrapper, so
+        # parse_pytest_feedback's summary-extraction regex never matches and
+        # status stays "unknown" even on a real pass. Match pytest's own
+        # digit-prefixed "N passed"/"N failed"/"N error(s)" wording directly
+        # (present verbatim in the [raw tail] section either way) instead.
+        state.pytest_all_green = (
+            bool(re.search(r"\b\d+\s+passed\b", result))
+            and not re.search(r"\b\d+\s+failed\b", result)
+            and not re.search(r"\b\d+\s+error(s)?\b", result)
+        )
     return result
 
 
@@ -1251,9 +1290,14 @@ def build_first_message(instruction: str, kind: str, workdir: Path, baseline: st
     return "\n".join(parts)
 
 
-def _run_sync_quiet(command: str) -> tuple[int, str]:
+def _run_sync_quiet(command: str, cwd: "Path | None" = None) -> tuple[int, str]:
+    """cwd defaults to None (inherits the process's own OS working directory,
+    NOT state.workdir/-app). Callers that run a command containing a
+    workdir-relative path (like bare "tests/") MUST pass cwd=state.workdir
+    explicitly - the process's OS cwd is wherever run.sh was launched from,
+    which is the agent's own runtime directory, not the task workspace."""
     try:
-        proc = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
+        proc = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30, cwd=cwd)
         return proc.returncode or 0, (proc.stdout + proc.stderr)
     except Exception as exc:
         return 1, repr(exc)
@@ -1320,9 +1364,12 @@ def _looks_like_bailout_placeholder(stripped_content: str) -> bool:
 
 def verify_deliverable(kind: str, deliverable: str, workdir: Path, expected_format: str = "") -> tuple[bool, str]:
     if kind == "fix" and not deliverable:
-        # Fix tasks have no file deliverable: done means the visible suite is green.
+        # Fix tasks have no file deliverable: done means the visible suite is
+        # green. Must run in workdir (cwd=) - "tests/" is relative to the
+        # task workspace, not wherever this process's OS cwd happens to be.
         code, text = _run_sync_quiet(
-            "python3 -m pytest tests/ -q --tb=no -p no:cacheprovider 2>&1 | tail -3"
+            "python3 -m pytest tests/ -q --tb=no -p no:cacheprovider 2>&1 | tail -3",
+            cwd=workdir,
         )
         ok = bool(re.search(r"\d+ passed", text)) and "failed" not in text and "error" not in text.lower()
         return ok, f"pytest: {text.strip()[-140:]}"
@@ -1676,6 +1723,7 @@ def make_history_compactor(
     request_budget: int = 0,
     deliverable: str = "",
     kind: str = "",
+    state: "AgentState | None" = None,
 ) -> Any:
     """pydantic-ai history processor: elides older tool outputs / assistant text so
     per-request input tokens stay bounded on long tasks (ACM paper: -20% tokens).
@@ -1692,6 +1740,16 @@ def make_history_compactor(
     state_req_no = {"n": 0}
 
     def _nudge() -> str | None:
+        # Generic mechanical-completion short-circuit: independent of budget
+        # fraction (the original waste this targets - repeated re-
+        # verification after an already-green pytest post-edit - happened
+        # at ~20-85% of a near-unbounded request_limit, well under the
+        # 55%/78% thresholds below, so it would never have been caught by
+        # the budget-percentage checks alone).
+        if state is not None and _mechanical_success(kind, state):
+            return ("[MECHANICAL SUCCESS DETECTED] Your last run_pytest call reported every test "
+                    "passing after your own edit. Do not run any more tools, re-verify again, or "
+                    "explore further. Immediately give your final answer now to end the task.")
         if not request_budget:
             return None
         used = state_req_no["n"]
@@ -1807,7 +1865,7 @@ async def run_pyai_loop(
         retries=2,
         system_prompt=build_system_prompt(kind, state.workdir),
         model_settings=_model_settings(),
-        **_history_kwargs(make_history_compactor(request_budget=request_budget, deliverable=deliverable, kind=kind, **(compactor_kwargs or {}))),
+        **_history_kwargs(make_history_compactor(request_budget=request_budget, deliverable=deliverable, kind=kind, state=state, **(compactor_kwargs or {}))),
     )
 
     # Explicit signatures: pydantic-ai derives tool schemas from type hints,
@@ -2031,9 +2089,11 @@ async def run_openai_fallback(
 # --------------------------------------------------------------------------- #
 
 
-def run_baseline_tests() -> str:
+def run_baseline_tests(workdir: Path) -> str:
+    # Must run in workdir (cwd=) - see _run_sync_quiet docstring.
     code, text = _run_sync_quiet(
-        "python3 -m pytest tests/ -q --tb=no -p no:cacheprovider 2>&1 | tail -6"
+        "python3 -m pytest tests/ -q --tb=no -p no:cacheprovider 2>&1 | tail -6",
+        cwd=workdir,
     )
     if "error" in text.lower() and "no tests ran" in text.lower():
         return ""
@@ -2168,6 +2228,20 @@ def _with_prior_activity(instruction: str, state: AgentState) -> str:
     )
 
 
+def _mechanical_success(kind: str, state: AgentState) -> bool:
+    """Generic (task-agnostic) completion check for fix-kind tasks: the
+    workspace was actually changed (some write tool returned "OK:") AND the
+    agent's own most recent run_pytest call reported every test passing.
+    Neither signal alone is sufficient - see AgentState's docstring - so
+    this is the single place both are combined. Used to skip restart/
+    fallback/repair once real, verifiable evidence of success already
+    exists on disk, instead of spending more model-driven double-checking
+    on a task that is mechanically already done. Deliberately keyed only on
+    these two generic flags: no task name, filename, vulnerability class, or
+    expected answer is referenced anywhere in this check."""
+    return kind == "fix" and state.workspace_modified and state.pytest_all_green
+
+
 async def main_async(instruction: str) -> str:
     state = AgentState(workdir=_resolve_workdir())
     _log("start", model=MODEL_NAME, workdir=str(state.workdir))
@@ -2215,7 +2289,7 @@ async def main_async(instruction: str) -> str:
          modifies_files=contract.modifies_files, deliverable_format=contract.deliverable_format)
 
     # 2) baseline tests for fix-type tasks (mechanical, free)
-    baseline = run_baseline_tests() if kind == "fix" else ""
+    baseline = run_baseline_tests(state.workdir) if kind == "fix" else ""
 
     # 3) main loop (per-minute rate limits get patient retry; daily caps fail fast;
     #    413 ITPM -> pause + aggressive compaction; other errors -> fallback loop)
@@ -2238,6 +2312,14 @@ async def main_async(instruction: str) -> str:
         except Exception as exc:
             _log("primary_loop_failed", error=repr(exc), attempt=attempt,
                  tb=traceback.format_exc()[-2000:])
+            if _mechanical_success(kind, state):
+                # Real evidence already exists on disk (a write tool
+                # succeeded AND the agent's own last pytest run was fully
+                # green) - whatever just failed the model call, there is
+                # nothing left to recover: don't restart, don't fall back.
+                _log("mechanical_success_skip_recovery",
+                     note="workspace_modified+pytest_all_green already true; skipping restart/fallback")
+                break
             if "UsageLimitExceeded" in repr(exc) or "request_limit" in repr(exc):
                 _log("budget_exhausted", note="normal completion; proceeding to verification/repair")
                 break
