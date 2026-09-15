@@ -853,7 +853,7 @@ def detect_trivial(instruction: str) -> tuple[str, str] | None:
 # required" or "do not modify the code" don't count as real fix signals just
 # because the bare word appears.
 _MODIFICATION_ACTION_WORDS = re.compile(
-    r"\bfix\b|\brepair\b|remediat|\bpatch\b|\bmodify\b|\bmodifying\b|"
+    r"\bfix\b|\brepair\b|remediat|\bpatch\b|\bmodify\b|\bmodifying\b|\bsecure\b|"
     r"edit the code|change the code|update the code"
 )
 _NEGATION_BEFORE_ACTION = re.compile(
@@ -903,10 +903,21 @@ def classify_mechanical(instruction: str) -> str:
     # task from being treated as "fix the vulnerability" just because it
     # names the vulnerability, while "no remediation is required" no longer
     # masquerades as a real fix instruction.
-    if not fix_signal and re.search(
-        r"do not modify|without modifying|read-?only|bug bounty|\baudit\b|\breport\b|\bfindings?\b|\bidentify\b|\bdocument\b",
+    strong_audit_signal = re.search(
+        r"do not modify|without modifying|read-?only|bug bounty|\baudit\b|\breport\b|\bfindings?\b|"
+        r"\bidentify\b|\bdocument\b",
         low,
-    ):
+    )
+    # inspect/analyze/investigate are weaker signals: "Investigate the
+    # service." alone is too vague to resolve mechanically (it could just as
+    # easily mean "investigate and fix"), so it must stay "generic" and hit
+    # the LLM contract-extraction fallback rather than being confidently
+    # (and possibly wrongly) locked into "audit". They only count once paired
+    # with an actual vulnerability mention, mirroring the real ambiguity this
+    # whole branch exists to resolve.
+    weak_audit_signal = re.search(r"\binspect\b|\banalyz(?:e|ing|is)\b|\binvestigat(?:e|ing|ion)\b", low)
+    vuln_mentioned = "vulnerab" in low or "insecure" in low
+    if not fix_signal and (strong_audit_signal or (weak_audit_signal and vuln_mentioned)):
         return "audit"
     if fix_signal and re.search(r"test|regression|pytest", low):
         return "fix"
@@ -931,8 +942,10 @@ def extract_explicit_deliverable_path(instruction: str) -> str:
         m = re.search(r"/app/[A-Za-z0-9_./-]+", instruction)
     if not m:
         # Non-/app absolute or relative path explicitly named, e.g. "write the
-        # report to output/report.json" (generalizes beyond the /app-only benchmark).
-        m = re.search(r"`([\w][\w./\-]*\.(?:json|txt|md))`", instruction)
+        # report to output/report.json" or "`/tmp/scan/report.json`"
+        # (generalizes beyond the /app-only benchmark; the optional leading
+        # "/" covers absolute paths outside /app, not just relative ones).
+        m = re.search(r"`(/?[\w][\w./\-]*\.(?:json|txt|md))`", instruction)
     if m:
         return m.group(1) if m.groups() and m.group(1) else m.group(0)
     return ""
@@ -948,8 +961,16 @@ def extract_explicit_deliverable_format(instruction: str) -> str:
     CTF branch can apply real structural validation instead of a bare
     length-floor guess for declared-but-unrecognized formats."""
     low = instruction.lower()
-    if re.search(r"flag\{", instruction):
-        return "flag"
+    flag_match = re.search(r"flag\{", instruction)
+    if flag_match:
+        # "not the usual flag{...} wrapper" names the flag{} pattern only to
+        # rule it out in favor of another declared format below - a bare
+        # substring match would wrongly lock in "flag" and never look
+        # further. A short pre-match window for a negation cue is enough to
+        # catch this without trying to fully parse the sentence.
+        before = low[max(0, flag_match.start() - 40):flag_match.start()]
+        if not re.search(r"\b(not|instead of|rather than|unlike|isn'?t)\b", before):
+            return "flag"
     if "key=value" in low or "key-value" in low or "key = value" in low:
         return "kv"
     if "json" in low:
@@ -1266,6 +1287,23 @@ _BAILOUT_PLACEHOLDERS = re.compile(
 )
 
 
+def _json_string_leaves(data: Any) -> list[str]:
+    """Collect every string leaf value out of a parsed JSON structure (dict/
+    list nesting), so bail-out-placeholder detection can look at the actual
+    payload values rather than the raw text - {"flag": "not found"} must not
+    pass just because the wrapper object is syntactically non-trivial."""
+    out: list[str] = []
+    if isinstance(data, str):
+        out.append(data)
+    elif isinstance(data, dict):
+        for v in data.values():
+            out.extend(_json_string_leaves(v))
+    elif isinstance(data, list):
+        for v in data:
+            out.extend(_json_string_leaves(v))
+    return out
+
+
 def _looks_like_bailout_placeholder(stripped_content: str) -> bool:
     """Generic (task-agnostic) detector for content that is structurally
     present but is almost certainly a give-up placeholder rather than a real
@@ -1343,11 +1381,22 @@ def verify_deliverable(kind: str, deliverable: str, workdir: Path, expected_form
                 return False, f"declared JSON format but content is not valid JSON: {exc}"
             if data in (None, {}, [], "", 0, False):
                 return False, "declared JSON format but content is empty/trivial JSON"
+            # Syntactic validity alone isn't enough: {"flag": "not found"} is
+            # valid, non-trivial JSON but its actual payload is a give-up
+            # placeholder. Check every string leaf, not just the raw text,
+            # so a wrapper object/array around a bail-out phrase doesn't
+            # slip past a whole-content check.
+            leaves = _json_string_leaves(data)
+            if leaves and all(_looks_like_bailout_placeholder(v.strip()) for v in leaves if v.strip()):
+                return False, "declared JSON format but its string content looks like a bail-out placeholder"
             return True, "ok"
         if fmt == "kv":
-            if re.search(r"^[a-z_]+=\S+$", content.strip(), re.MULTILINE):
-                return True, "ok"
-            return False, "declared key=value format but no key=value line found"
+            m = re.search(r"^([a-z_]+)=(\S+)$", content.strip(), re.MULTILINE)
+            if not m:
+                return False, "declared key=value format but no key=value line found"
+            if _looks_like_bailout_placeholder(m.group(2).strip()):
+                return False, "declared key=value format but its value looks like a bail-out placeholder"
+            return True, "ok"
         structural = CTF_STRUCTURAL_FORMATS.get(fmt)
         if structural:
             if structural.match(content.strip()):
