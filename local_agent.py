@@ -2001,14 +2001,31 @@ async def run_openai_fallback(
         if time_left() <= 20:
             break
         _shrink_history(messages)
-        response = await client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=messages,
-            tools=tools,
-            tool_choice="auto",
-            temperature=TEMPERATURE,
-            extra_body=_reasoning_extra_body(),
-        )
+        try:
+            response = await client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                temperature=TEMPERATURE,
+                extra_body=_reasoning_extra_body(),
+            )
+        except Exception as exc:
+            # A transient 5xx here used to abort the entire fallback path on
+            # the first hit (no retry existed at this call site at all) -
+            # see _is_transient_service_error's docstring for why that is
+            # wasteful. One bounded retry of the SAME turn; anything else
+            # (balance exhausted, daily cap, or retries used up) propagates
+            # to the caller exactly as before.
+            if _is_balance_exhausted(exc) or _is_daily_cap(exc):
+                raise
+            if _is_transient_service_error(exc):
+                wait = _bounded_backoff(10.0, reserve=20.0)
+                if wait is not None:
+                    _log("fallback_service_unavailable_backoff", wait_s=round(wait, 1))
+                    await asyncio.sleep(wait)
+                    continue
+            raise
         choices = getattr(response, "choices", None) or []
         if not choices:
             # OpenRouter may return a 200 with choices=None when the upstream
@@ -2197,6 +2214,39 @@ def _is_daily_cap(exc: Exception) -> bool:
             or "requests per day" in text or "RPD" in text)
 
 
+def _is_balance_exhausted(exc: Exception) -> bool:
+    """402/insufficient-balance: a provider-account condition, not a per-request
+    fluke. Waiting or retrying the same endpoint cannot fix it within this run -
+    fail fast (like _is_daily_cap) instead of burning wall-clock on doomed
+    retries or escalating into fallback/repair paths that will hit the same
+    wall. Deliberately endpoint-agnostic wording (any OpenAI-compatible
+    provider uses some variant of these terms for the same condition)."""
+    text = repr(exc)
+    return ("insufficient_balance" in text.lower() or "insufficient balance" in text.lower()
+            or "status_code: 402" in text or "'code': 402" in text)
+
+
+def _is_transient_service_error(exc: Exception) -> bool:
+    """5xx from the model endpoint (gateway/service temporarily unavailable,
+    overloaded, bad gateway, etc.) is a per-request fluke distinct from a
+    daily/balance cap: a short bounded wait and retry on the SAME request
+    typically clears it (observed repeatedly: a burst of 503s followed by a
+    normal successful completion later in the same run). Previously these
+    fell through every existing classifier (not a 429, not a connection
+    error, not a token-limit message) straight into an immediate escalation
+    to the fallback path - on tasks where that first request happened before
+    any tool call, this could burn the whole primary attempt without the
+    model ever seeing the task. Endpoint-agnostic: matches on HTTP semantics
+    (5xx) and the generic phrase "service unavailable", never a specific
+    provider's error schema."""
+    text = repr(exc)
+    if re.search(r"status_code:\s*5\d\d\b", text):
+        return True
+    if re.search(r"'code':\s*5\d\d\b", text):
+        return True
+    return "service_unavailable" in text.lower() or "service unavailable" in text.lower()
+
+
 def _is_input_token_limit(exc: Exception) -> bool:
     """413 ITPM: too much context in one request. Wait for the minute window and
     retry with aggressive history compaction (workspace state is preserved, so a
@@ -2326,6 +2376,18 @@ async def main_async(instruction: str) -> str:
             if _is_daily_cap(exc):
                 _log("daily_cap_hit", note="fail fast; switch API key to continue")
                 break
+            if _is_balance_exhausted(exc):
+                _log("balance_exhausted", note="fail fast; account-level condition, retrying/escalating cannot help")
+                break
+            if _is_transient_service_error(exc) and attempt < 3:
+                wait = _bounded_backoff(10.0)
+                if wait is not None:
+                    _log("service_unavailable_backoff", wait_s=round(wait, 1),
+                         note="5xx/service-unavailable; short bounded wait before retrying the same request")
+                    state.restart_count += 1
+                    active_instruction = _with_prior_activity(instruction, state)
+                    await asyncio.sleep(wait)
+                    continue
             if _is_input_token_limit(exc) and attempt < 3:
                 wait = _bounded_backoff(20.0)
                 if wait is not None:
