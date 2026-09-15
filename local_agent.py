@@ -847,6 +847,44 @@ def detect_trivial(instruction: str) -> tuple[str, str] | None:
     return None
 
 
+# Vocabulary for "an actual code modification is requested" - shared between
+# classify_mechanical() and detect_modifies_files() so both agree, and
+# negation-checked (see _has_real_action_signal) so "no remediation is
+# required" or "do not modify the code" don't count as real fix signals just
+# because the bare word appears.
+_MODIFICATION_ACTION_WORDS = re.compile(
+    r"\bfix\b|\brepair\b|remediat|\bpatch\b|\bmodify\b|\bmodifying\b|"
+    r"edit the code|change the code|update the code"
+)
+_NEGATION_BEFORE_ACTION = re.compile(
+    r"\b(no|not|without|isn'?t|doesn'?t|don'?t|never|none of|excluding|"
+    r"out of scope for)\b[\s\w'-]{0,25}$"
+)
+_NEGATION_AFTER_ACTION = re.compile(
+    r"^[\s\w'-]{0,30}\b(is not required|is not necessary|is not needed|"
+    r"not required|not necessary|not needed|is out of scope|not requested|"
+    r"not part of this|not in scope)\b"
+)
+
+
+def _has_real_action_signal(low: str, pattern: "re.Pattern[str]") -> bool:
+    """True if `pattern` matches somewhere in `low` that is NOT negated by
+    nearby "no/not/without/..." (before) or "...is not required/out of
+    scope" (after) phrasing. A bare substring match on "remediat" or
+    "modify" is not enough evidence on its own - "no remediation is
+    required" and "do not modify the code" both contain the word but mean
+    the opposite of a modification request."""
+    for m in pattern.finditer(low):
+        before = low[max(0, m.start() - 30):m.start()]
+        after = low[m.end():m.end() + 45]
+        if _NEGATION_BEFORE_ACTION.search(before):
+            continue
+        if _NEGATION_AFTER_ACTION.match(after):
+            continue
+        return True
+    return False
+
+
 def classify_mechanical(instruction: str) -> str:
     low = instruction.lower()
     if "incident_report" in low or "key=value" in low or "forensic" in low:
@@ -855,14 +893,16 @@ def classify_mechanical(instruction: str) -> str:
         return "audit"
     if "flag{" in low or "ctf" in low or "capture the flag" in low:
         return "ctf"
-    fix_signal = re.search(r"\bfix\b|\brepair\b|remediat|\bpatch\b", low)
+    fix_signal = _has_real_action_signal(low, _MODIFICATION_ACTION_WORDS)
     # Find/audit-only tasks almost always name the bug class too ("SQL
     # injection vulnerability", "insecure endpoint"), so a bare vulnerab/
     # insecure catch-all below would misroute them into fix mode. Checking
     # explicit report/read-only/identify-only signals first - and only when
-    # there is no actual fix/repair/patch instruction alongside them - keeps
-    # a hidden "find the vulnerability and report it" task from being treated
-    # as "fix the vulnerability" just because it names the vulnerability.
+    # there is no actual (non-negated) fix/repair/patch/modify instruction
+    # alongside them - keeps a hidden "find the vulnerability and report it"
+    # task from being treated as "fix the vulnerability" just because it
+    # names the vulnerability, while "no remediation is required" no longer
+    # masquerades as a real fix instruction.
     if not fix_signal and re.search(
         r"do not modify|without modifying|read-?only|bug bounty|\baudit\b|\breport\b|\bfindings?\b|\bidentify\b|\bdocument\b",
         low,
@@ -900,7 +940,13 @@ def extract_explicit_deliverable_path(instruction: str) -> str:
 
 def extract_explicit_deliverable_format(instruction: str) -> str:
     """Deterministic best-effort read of a deliverable format the instruction
-    states explicitly. Returns "" (unknown/unstated) rather than guessing."""
+    states explicitly. Returns "" (unknown/unstated) rather than guessing.
+
+    The extra encoding-vocabulary checks below (sha256/md5/uuid/hex/base64/
+    numeric/word) recognize common ways a task DESCRIBES its expected format
+    - never any task's actual answer/flag value - so verify_deliverable()'s
+    CTF branch can apply real structural validation instead of a bare
+    length-floor guess for declared-but-unrecognized formats."""
     low = instruction.lower()
     if re.search(r"flag\{", instruction):
         return "flag"
@@ -908,14 +954,33 @@ def extract_explicit_deliverable_format(instruction: str) -> str:
         return "kv"
     if "json" in low:
         return "json"
+    if re.search(r"\bsha-?256\b", low):
+        return "sha256"
+    if re.search(r"\bsha-?1\b", low):
+        return "sha1"
+    if re.search(r"\bmd5\b", low):
+        return "md5"
+    if re.search(r"\buuid\b", low):
+        return "uuid"
+    if re.search(r"\bhex(?:adecimal)?\b", low):
+        return "hex"
+    if re.search(r"\bbase64\b", low):
+        return "base64"
+    if re.search(r"\bnumeric\b|\ba number\b|\ban integer\b", low):
+        return "numeric"
+    if re.search(r"single word|one word|single token|one token", low):
+        return "word"
     return ""
 
 
 def detect_modifies_files(instruction: str) -> bool:
     """Deterministic best-effort read of whether the task requires editing
-    application/source files (vs. just producing a report/flag)."""
-    low = instruction.lower()
-    return bool(re.search(r"\bfix\b|\brepair\b|remediat|\bpatch\b|\bmodify\b|edit the code|change the code|update the code", low))
+    application/source files (vs. just producing a report/flag). Shares
+    _MODIFICATION_ACTION_WORDS/_has_real_action_signal with
+    classify_mechanical() so "do not modify the code" or "no remediation is
+    required" don't get read as a modification request just because the
+    bare word appears."""
+    return _has_real_action_signal(instruction.lower(), _MODIFICATION_ACTION_WORDS)
 
 
 def guess_deliverable(instruction: str, kind: str, workdir: Path) -> str:
@@ -1178,6 +1243,43 @@ def _run_sync_quiet(command: str) -> tuple[int, str]:
 # --------------------------------------------------------------------------- #
 
 
+# Structural (not semantic) validators for non-flag CTF deliverable formats
+# a task can explicitly declare. These check SHAPE only (length/charset) -
+# never a specific task's actual answer - so they generalize to any hidden
+# task that asks for one of these common encodings.
+CTF_STRUCTURAL_FORMATS = {
+    "sha256": re.compile(r"^[0-9a-fA-F]{64}$"),
+    "sha1": re.compile(r"^[0-9a-fA-F]{40}$"),
+    "md5": re.compile(r"^[0-9a-fA-F]{32}$"),
+    "uuid": re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"),
+    "hex": re.compile(r"^[0-9a-fA-F]+$"),
+    "base64": re.compile(r"^[A-Za-z0-9+/_-]+={0,2}$"),
+    "numeric": re.compile(r"^-?\d+$"),
+    "word": re.compile(r"^\S+$"),
+}
+
+_BAILOUT_PLACEHOLDERS = re.compile(
+    r"^(n/?a|none|null|todo|unknown|placeholder|not[\s_-]?found|no flag(\s+found)?|"
+    r"unable to (determine|find|solve)|could not (determine|find|solve)|"
+    r"flag not found|no answer|tbd|xxx+|\?+|\.+|-+|_+)$",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_bailout_placeholder(stripped_content: str) -> bool:
+    """Generic (task-agnostic) detector for content that is structurally
+    present but is almost certainly a give-up placeholder rather than a real
+    attempt at the deliverable: known bail-out phrases, or a single character
+    repeated across the whole (very low information content)."""
+    low = stripped_content.strip().lower()
+    if _BAILOUT_PLACEHOLDERS.match(low):
+        return True
+    no_space = re.sub(r"\s+", "", low)
+    if no_space and len(set(no_space)) == 1:
+        return True
+    return False
+
+
 def verify_deliverable(kind: str, deliverable: str, workdir: Path, expected_format: str = "") -> tuple[bool, str]:
     if kind == "fix" and not deliverable:
         # Fix tasks have no file deliverable: done means the visible suite is green.
@@ -1246,13 +1348,24 @@ def verify_deliverable(kind: str, deliverable: str, workdir: Path, expected_form
             if re.search(r"^[a-z_]+=\S+$", content.strip(), re.MULTILINE):
                 return True, "ok"
             return False, "declared key=value format but no key=value line found"
-        if fmt and fmt != "flag":
-            # Some other explicitly declared non-flag format we have no
-            # structural validator for; still enforce a minimal length floor
-            # so a stray character or blank-ish file can't pass as "ok".
-            if len(content.strip()) < 3:
-                return False, "content too short to be a plausible deliverable for the declared format"
-            return True, "ok"
+        structural = CTF_STRUCTURAL_FORMATS.get(fmt)
+        if structural:
+            if structural.match(content.strip()):
+                return True, "ok"
+            return False, f"declared {fmt!r} format but content does not match its expected structure"
+        if fmt:
+            # A non-flag format we have no structural validator for. We
+            # cannot verify semantic correctness here (we don't know the
+            # task's real answer and must not encode one) - only filter out
+            # content that is structurally implausible as ANY deliverable:
+            # empty-ish, a bail-out placeholder a model emits when it gave
+            # up, or degenerate (single repeated character/no real content).
+            stripped = content.strip()
+            if len(stripped) < 3 or len(stripped) > 4096:
+                return False, "content length implausible for a deliverable (too short or too long)"
+            if _looks_like_bailout_placeholder(stripped):
+                return False, "content looks like a bail-out placeholder, not an actual deliverable"
+            return True, "ok (format has no structural validator - content passed only a plausibility check, not a correctness check)"
         return False, "no flag{...}-style pattern found and no non-flag format was explicitly declared by the task"
     return True, "ok"
 
